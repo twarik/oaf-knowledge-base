@@ -1,19 +1,19 @@
 import streamlit as st
 import os
-import json
+import tempfile
+import pandas as pd
 from dotenv import load_dotenv
 from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
 from supabase import create_client, Client
-import tempfile
-import pandas as pd
+import cohere
 
 # ── Load environment variables ────────────────────────────────
 load_dotenv()
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SUPABASE_URL  = os.getenv("SUPABASE_URL")  or st.secrets.get("SUPABASE_URL", "")
+SUPABASE_KEY  = os.getenv("SUPABASE_KEY")  or st.secrets.get("SUPABASE_KEY", "")
+COHERE_API_KEY = os.getenv("COHERE_API_KEY") or st.secrets.get("COHERE_API_KEY", "")
 
 # ── Page config ───────────────────────────────────────────────
 st.set_page_config(
@@ -86,16 +86,21 @@ def init_supabase():
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 @st.cache_resource
-def init_embeddings():
-    with st.spinner("Loading embedding model (first time only, ~30 seconds)..."):
-        return HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2",
-            model_kwargs={"device": "cpu"},
-            encode_kwargs={"normalize_embeddings": True}
-        )
+def init_cohere():
+    return cohere.Client(COHERE_API_KEY)
 
-supabase   = init_supabase()
-embeddings = init_embeddings()
+supabase = init_supabase()
+co       = init_cohere()
+
+def get_embedding(text, input_type="search_document"):
+    """Get 384-dim embedding from Cohere."""
+    response = co.embed(
+        texts=[text],
+        model="embed-multilingual-light-v3.0",
+        input_type=input_type,
+        embedding_types=["float"]
+    )
+    return response.embeddings.float[0]
 
 # ── Header ────────────────────────────────────────────────────
 st.title("🌱 OAF Uganda — Agronomy Knowledge Base Manager")
@@ -165,7 +170,7 @@ with st.sidebar:
     st.divider()
     st.markdown("**Connected to:**")
     st.markdown(f"🗄️ Supabase: `{SUPABASE_URL[:30]}...`")
-    st.markdown("🤖 Model: `all-MiniLM-L6-v2` (free)")
+    st.markdown("🤖 Model: `embed-multilingual-light-v3.0` (Cohere free)")
 
 # ── Build tabs based on role permissions ─────────────────────
 tab_labels = []
@@ -192,23 +197,16 @@ if can("upload"):
             help="Supported formats: PDF (.pdf) and Word Document (.docx)"
         )
 
-        # Unsupported format check
         if uploaded_file is not None:
             file_ext = uploaded_file.name.split(".")[-1].lower()
             if file_ext not in ["pdf", "docx"]:
-                st.error(
-                    f"❌ Format .{file_ext} is not supported. "
-                    f"Please upload a PDF or Word document (.docx)."
-                )
+                st.error(f"❌ Format .{file_ext} is not supported. Please upload a PDF or Word document (.docx).")
                 uploaded_file = None
 
         if uploaded_file is not None:
             file_ext  = uploaded_file.name.split(".")[-1].lower()
             file_type = "PDF" if file_ext == "pdf" else "Word Document"
-            st.success(
-                f"✅ File loaded: **{uploaded_file.name}** "
-                f"({file_type} — {round(uploaded_file.size/1024, 1)} KB)"
-            )
+            st.success(f"✅ File loaded: **{uploaded_file.name}** ({file_type} — {round(uploaded_file.size/1024, 1)} KB)")
 
             if not source:
                 st.warning("⚠️ Please enter a Document Source in the sidebar before uploading.")
@@ -217,22 +215,14 @@ if can("upload"):
                 with col1:
                     preview_btn = st.button("👁️ Preview Chunks", use_container_width=True)
                 with col2:
-                    upload_btn = st.button(
-                        "🚀 Upload to Knowledge Base",
-                        use_container_width=True,
-                        type="primary"
-                    )
+                    upload_btn = st.button("🚀 Upload to Knowledge Base", use_container_width=True, type="primary")
 
                 if preview_btn or upload_btn:
                     with st.spinner("Extracting text from document..."):
-                        with tempfile.NamedTemporaryFile(
-                            delete=False,
-                            suffix=f".{file_ext}"
-                        ) as tmp:
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_ext}") as tmp:
                             tmp.write(uploaded_file.read())
                             tmp_path = tmp.name
 
-                        # Load based on file type
                         if file_ext == "pdf":
                             loader = PyPDFLoader(tmp_path)
                         elif file_ext == "docx":
@@ -251,22 +241,15 @@ if can("upload"):
                         chunks = splitter.split_documents(pages)
                         os.unlink(tmp_path)
 
-                    st.info(
-                        f"📄 **{len(pages)} pages** extracted → "
-                        f"split into **{len(chunks)} chunks**"
-                    )
+                    st.info(f"📄 **{len(pages)} pages** extracted → split into **{len(chunks)} chunks**")
 
-                    # ── Preview ───────────────────────────────
                     if preview_btn:
                         st.subheader(f"Preview — First 3 Chunks of {len(chunks)}")
                         for i, chunk in enumerate(chunks[:3]):
-                            with st.expander(
-                                f"Chunk {i+1} — {len(chunk.page_content.split())} words"
-                            ):
+                            with st.expander(f"Chunk {i+1} — {len(chunk.page_content.split())} words"):
                                 st.write(chunk.page_content)
                                 st.caption(f"Page: {chunk.metadata.get('page', 'N/A')}")
 
-                    # ── Upload ────────────────────────────────
                     if upload_btn:
                         metadata = {
                             "source":      source,
@@ -284,10 +267,8 @@ if can("upload"):
 
                         for i, chunk in enumerate(chunks):
                             try:
-                                status_text.text(
-                                    f"Embedding chunk {i+1} of {len(chunks)}..."
-                                )
-                                vector     = embeddings.embed_query(chunk.page_content)
+                                status_text.text(f"Embedding chunk {i+1} of {len(chunks)}...")
+                                vector     = get_embedding(chunk.page_content, input_type="search_document")
                                 chunk_meta = {
                                     **metadata,
                                     "page":        chunk.metadata.get("page", 0),
@@ -318,10 +299,7 @@ if can("upload"):
                             """)
 
                         if error_count > 0:
-                            st.warning(
-                                f"⚠️ {error_count} chunks failed. "
-                                f"Check your Supabase connection."
-                            )
+                            st.warning(f"⚠️ {error_count} chunks failed. Check your Cohere API key.")
 
     tab_index += 1
 
@@ -370,9 +348,7 @@ if can("view"):
                         if r.get("metadata", {}).get("source") == source_name
                     ]
 
-                    with st.expander(
-                        f"📄 {source_name} — {len(source_chunks)} chunks"
-                    ):
+                    with st.expander(f"📄 {source_name} — {len(source_chunks)} chunks"):
                         col1, col2 = st.columns([3, 1])
 
                         with col1:
@@ -381,9 +357,7 @@ if can("view"):
                                 st.markdown(f"**Species:** {meta.get('species', 'N/A')}")
                                 st.markdown(f"**Topic:** {meta.get('topic', 'N/A')}")
                                 st.markdown(f"**Pages:** {meta.get('pages', 'N/A')}")
-                                st.markdown(
-                                    f"**Uploaded by:** {meta.get('uploaded_by', 'N/A')}"
-                                )
+                                st.markdown(f"**Uploaded by:** {meta.get('uploaded_by', 'N/A')}")
 
                         with col2:
                             if can("delete"):
@@ -391,9 +365,7 @@ if can("view"):
                                     ids = [r["id"] for r in source_chunks]
                                     for doc_id in ids:
                                         supabase.table("oaf_knowledge_base")\
-                                            .delete()\
-                                            .eq("id", doc_id)\
-                                            .execute()
+                                            .delete().eq("id", doc_id).execute()
                                     st.success(f"Deleted {len(ids)} chunks")
                                     st.rerun()
                             else:
@@ -404,10 +376,6 @@ if can("view"):
 
         except Exception as e:
             st.error(f"Error fetching knowledge base: {str(e)}")
-            st.info(
-                "Make sure your Supabase credentials are correct "
-                "and the oaf_knowledge_base table exists."
-            )
 
     tab_index += 1
 
@@ -417,10 +385,7 @@ if can("view"):
 if can("search"):
     with tabs[tab_index]:
         st.subheader("Test Semantic Search")
-        st.markdown(
-            "Test how the knowledge base responds to field officer questions. "
-            "This is exactly how the Telegram advisory bot searches for answers."
-        )
+        st.markdown("Test how the knowledge base responds to field officer questions.")
 
         test_query = st.text_input(
             "Enter a test question",
@@ -435,21 +400,19 @@ if can("search"):
                 key="search_species"
             )
         with col2:
-            top_k = st.slider("Number of results to retrieve", 1, 10, 3)
+            top_k = st.slider("Number of results", 1, 10, 3)
 
         similarity_threshold = st.slider(
             "Similarity threshold",
-            min_value=0.1, max_value=0.9, value=0.5, step=0.05,
+            min_value=0.1, max_value=0.9, value=0.3, step=0.05,
             help="Higher = only very close matches. Lower = broader results."
         )
 
         if st.button("🔍 Search Knowledge Base", type="primary") and test_query:
             with st.spinner("Searching knowledge base..."):
                 try:
-                    # Convert question to vector
-                    query_vector = embeddings.embed_query(test_query)
+                    query_vector = get_embedding(test_query, input_type="search_query")
 
-                    # Search Supabase pgvector
                     response = supabase.rpc(
                         "match_oaf_documents",
                         {
@@ -462,10 +425,7 @@ if can("search"):
                     results = response.data
 
                     if not results:
-                        st.warning(
-                            "No matching documents found. "
-                            "Try lowering the similarity threshold or uploading more documents."
-                        )
+                        st.warning("No matching documents found. Try lowering the similarity threshold.")
                     else:
                         st.success(f"✅ Found {len(results)} relevant chunks")
                         st.divider()
@@ -475,8 +435,7 @@ if can("search"):
                             meta       = result.get("metadata", {})
 
                             with st.expander(
-                                f"Result {i+1} — Similarity: {similarity} | "
-                                f"{meta.get('source', 'Unknown source')}"
+                                f"Result {i+1} — Similarity: {similarity} | {meta.get('source', 'Unknown')}"
                             ):
                                 st.write(result.get("content", ""))
                                 st.divider()
@@ -487,16 +446,11 @@ if can("search"):
 
                 except Exception as e:
                     st.error(f"Search error: {str(e)}")
-                    st.info(
-                        "Make sure you have run the match_oaf_documents "
-                        "SQL function in Supabase SQL Editor."
-                    )
 
 # ── Footer ─────────────────────────────────────────────────────
 st.divider()
 st.caption(
-    f"OAF Uganda AI Advisory System — Knowledge Base Manager v1.0 | "
-    f"Logged in as: {st.session_state.username} "
-    f"({st.session_state.user_role}) | "
-    f"Built with Streamlit + LangChain + Supabase pgvector"
+    f"OAF Uganda AI Advisory System — Knowledge Base Manager v2.0 | "
+    f"Logged in as: {st.session_state.username} ({st.session_state.user_role}) | "
+    f"Powered by Cohere + Supabase pgvector"
 )
